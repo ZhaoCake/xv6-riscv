@@ -10,3 +10,16 @@ _*
 /user/usys.S
 .gdbinit
 TAGS
+
+# nix
+result
+result-*
+
+# direnv
+.direnv/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo

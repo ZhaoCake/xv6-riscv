@@ -23,22 +23,5 @@
           ];
         };
 
-        packages.xv6 = pkgs.stdenv.mkDerivation {
-          name = "xv6-riscv";
-          src = ./.;
-          nativeBuildInputs = with pkgs; [
-            riscv-pkgs.gcc
-            riscv-pkgs.binutils
-            gcc
-            perl
-            bc
-          ];
-          buildPhase = "make";
-          installPhase = ''
-            mkdir -p $out
-            cp kernel/kernel fs.img $out/
-          '';
-        };
-        packages.default = self.packages.${system}.xv6;
       });
 }

@@ -431,6 +431,17 @@ sys_chdir(void)
   return 0;
 }
 
+/*
+ * exec 系统调用的用户态→内核态桥接函数。
+ *
+ * 系统调用的参数来自用户寄存器，需要：
+ *   ① argstr(0, path) — 从用户空间取出第 0 个参数（可执行文件路径名）
+ *   ② argaddr(1, &uargv) — 取出第 1 个参数（argv 数组在用户空间的地址）
+ *   ③ 遍历用户空间的 argv 数组，用 fetchstr() 逐个把字符串
+ *      从用户页表拷贝到内核页表（kalloc 分配的临时缓冲区）
+ *   ④ 调用 kexec() 做真正的加载工作
+ *   ⑤ 释放临时分配的 argv 缓冲
+ */
 uint64
 sys_exec(void)
 {

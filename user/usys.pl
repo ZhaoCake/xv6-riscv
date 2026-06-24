@@ -29,7 +29,7 @@ entry("read");
 entry("write");
 entry("close");
 entry("kill");
-entry("exec");
+entry("exec");  # 生成 exec 用户态桩：把 a7=7 → ecall → 陷入内核
 entry("open");
 entry("mknod");
 entry("unlink");

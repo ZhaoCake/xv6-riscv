@@ -1,3 +1,16 @@
+/*
+ * exec 系统调用的内核实现。
+ *
+ * 作用：把当前进程替换成一个全新的程序。
+ *   - 读取 ELF 格式的可执行文件
+ *   - 分配新页表，把代码段、数据段加载进去
+ *   - 建立用户栈，压入 argv 参数
+ *   - 切换到新页表，释放旧页表
+ *   - 返回后用户程序从 _start 开始执行
+ *
+ * 关键语义：exec 成功则永不返回（当前进程已被替换）。
+ * 只有失败（文件不存在、格式错误等）才返回 -1。
+ */
 #include "types.h"
 #include "param.h"
 #include "memlayout.h"
@@ -21,9 +34,26 @@ flags2perm(int flags)
   return perm;
 }
 
-//
-// the implementation of the exec() system call
-//
+/*
+ * exec 的核心实现。
+ *
+ * 流程图：
+ *   ① 用 namei() 按路径名找到磁盘上的 inode
+ *   ② 从 inode 读出 ELF header，验证魔数
+ *   ③ 分配新页表
+ *   ④ 遍历 ELF 的 program header，把代码段/数据段加载到内存
+ *   ⑤ 分配用户栈（含栈保护页）
+ *   ⑥ 把 argv 字符串拷贝到用户栈上
+ *   ⑦ 保存入口地址到 trapframe->epc
+ *   ⑧ 切换到新页表，释放旧页表
+ *   ⑨ 返回 argc → 它会在 a0 寄存器中传给新程序的 main(argc, argv)
+ *
+ * 成功后：旧进程的页表、内存、打开的文件等全部丢弃，
+ *        只剩 PID、文件描述符表（需要时手动设置 FD_CLOEXEC）等少量属性保留。
+ *         这就是为什么 shell fork() 后 exec() 时，
+ *         dup() 过的管道 fd 在子进程里还在——它们属于进程，
+ *         exec 不会关它们（除非设置了 close-on-exec）。
+ */
 int
 kexec(char *path, char **argv)
 {

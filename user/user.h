@@ -11,6 +11,24 @@ int write(int, const void *, int);
 int read(int, void *, int);
 int close(int);
 int kill(int);
+/*
+ * exec(path, argv) — 把当前进程替换为 path 指定的程序。
+ *
+ * 参数：
+ *   path — 可执行文件路径，如 "/bin/ls" 或 "cat"
+ *   argv — 参数字符串数组，以 NULL 结尾，如 {"ls", "-l", NULL}
+ *
+ * 返回值：
+ *   成功 — 永不返回（当前进程已被替换）
+ *   失败 — 返回 -1，原进程继续执行
+ *
+ * 典型用法（shell 模式）：
+ *   if (fork() == 0) {      // 子进程
+ *       exec("cat", av);    // 替换成 cat
+ *       exit(1);            // 只有 exec 失败才走到这里
+ *   }
+ *   wait(0);                // 父进程等待
+ */
 int exec(const char *, char **);
 int open(const char *, int);
 int mknod(const char *, short, short);

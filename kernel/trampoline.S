@@ -1,13 +1,22 @@
         #
-        # low-level code to handle traps from user space into
-        # the kernel, and returns from kernel to user.
+        # trampoline.S — 用户态↔内核态切换的汇编入口。
         #
-        # the kernel maps the page holding this code
-        # at the same virtual address (TRAMPOLINE)
-        # in user and kernel space so that it continues
-        # to work when it switches page tables.
-        # kernel.ld causes this code to start at 
-        # a page boundary.
+        # 这是 xv6 中最重要的汇编代码。
+        # 它解答了一个关键问题：
+        #
+        #   用户态执行 ecall 后，CPU 切换到 S-mode，
+        #   但页表还是用户的——此时 PC 在这段代码上。
+        #   怎么保证执行完几行指令后，切换到内核页表时
+        #   PC 不会指向非法地址？
+        #
+        # 答案：这段代码被同时映射到用户页表和内核页表的
+        #   相同虚拟地址（TRAMPOLINE）上。
+        #   切换页表前后，PC 指向的是同一块物理内存。
+        #
+        # 内核启动时把 uservec 的地址写入 stvec CSR，
+        # 所以每次 ecall / 中断都跳到这里。
+        #
+        # trapframe 则映射在 TRAMPOLINE 下一页（也是两个页表共享）。
         #
 
 #include "riscv.h"
@@ -21,22 +30,29 @@ trampoline:
 .globl uservec
 uservec:    
 	#
-        # trap.c sets stvec to point here, so
-        # traps from user space start here,
-        # in supervisor mode, but with a
-        # user page table.
+        # uservec — 从用户态陷入内核的入口。
+        #
+        # 进入此时代码在 TRAMPOLINE 虚拟地址上运行，
+        # 页表还是用户的，但 CPU 已经是 S-mode 了。
+        #
+        # 要做的事：
+        #   ① 保存所有用户寄存器到 trapframe
+        #   ② 切换到内核页表
+        #   ③ 跳转到 usertrap()（C 函数）
         #
 
-        # save user a0 in sscratch so
-        # a0 can be used to get at TRAPFRAME.
+        # 先保存用户 a0 到 sscratch（专用暂存 CSR）。
+        # 因为马上要用 a0 来指路 trapframe。
+        # RISC-V 的 sscratch CSR 就是为这种场景设计的。
         csrw sscratch, a0
 
-        # each process has a separate p->trapframe memory area,
-        # but it's mapped to the same virtual address
-        # (TRAPFRAME) in every process's user page table.
+        # 每个进程有独立的 trapframe 内存页，
+        # 但在所有用户页表中都映射在相同虚拟地址 TRAPFRAME 上。
+        # 这是另一个"共享页"技巧——和 TRAMPOLINE 同理。
         li a0, TRAPFRAME
         
-        # save the user registers in TRAPFRAME
+        # 保存所有用户寄存器到 p->trapframe
+        # （偏移量参见 proc.h 中 struct trapframe 的布局）
         sd ra, 40(a0)
         sd sp, 48(a0)
         sd gp, 56(a0)
@@ -68,45 +84,56 @@ uservec:
         sd t5, 272(a0)
         sd t6, 280(a0)
 
-	# save the user a0 in p->trapframe->a0
+	# 把用户 a0（之前暂存在 sscratch 的）恢复出来，
+        # 存到 trapframe+112 的位置（struct trapframe 的 a0 字段）。
         csrr t0, sscratch
         sd t0, 112(a0)
 
-        # initialize kernel stack pointer, from p->trapframe->kernel_sp
+        # 加载内核栈指针（来自 trapframe 中的 kernel_sp）。
+        # 从此 sp 指向进程自己的内核栈——可以在 C 函数里正常调用了。
         ld sp, 8(a0)
 
-        # make tp hold the current hartid, from p->trapframe->kernel_hartid
+        # 加载 hartid（CPU 编号）到 tp 寄存器。
+        # xv6 用 tp 存 hartid，这样 myproc() / cpuid() 就能用 tp 找到当前 CPU。
         ld tp, 32(a0)
 
-        # load the address of usertrap(), from p->trapframe->kernel_trap
+        # 加载 usertrap() 函数的地址。
+        # 所有准备工作完成后，跳转到 C 代码处理陷阱。
         ld t0, 16(a0)
 
-        # fetch the kernel page table address, from p->trapframe->kernel_satp.
+        # 加载内核页表的 satp 值。
         ld t1, 0(a0)
 
-        # wait for any previous memory operations to complete, so that
-        # they use the user page table.
+        # 执行完上述 ld 后确保 TLB 中存的仍是用户页表的内容。
         sfence.vma zero, zero
 
-        # install the kernel page table.
+        # 切换到内核页表。
         csrw satp, t1
 
-        # flush now-stale user entries from the TLB.
+        # flush TLB：之前缓存的用户页表项已经失效了。
         sfence.vma zero, zero
 
-        # call usertrap()
+        # 跳转到 usertrap()——进入 C 世界。
         jalr t0
 
 .globl userret
 userret:
-        # usertrap() returns here, with user satp in a0.
-        # return from kernel to user.
+        #
+        # userret — 从内核返回用户态。
+        #
+        # 从 usertrap() 返回后，a0 中装着用户页表的 satp 值。
+        # 反向执行 uservec 的步骤：
+        #   ① 切换回用户页表
+        #   ② 从 trapframe 恢复所有寄存器
+        #   ③ sret 回到用户态
+        #
 
-        # switch to the user page table.
+        # 切换回用户页表（a0 中传入了用户 satp）。
         sfence.vma zero, zero
         csrw satp, a0
         sfence.vma zero, zero
 
+        # 用 a0 指路 trapframe，开始恢复寄存器。
         li a0, TRAPFRAME
 
         # restore all but a0 from TRAPFRAME
@@ -141,9 +168,16 @@ userret:
         ld t5, 272(a0)
         ld t6, 280(a0)
 
-	# restore user a0
+	# 最后恢复用户 a0（从 trapframe 加载）。
+        # 注意这必须最后做——前一条 ld 用 a0 指向 trapframe。
         ld a0, 112(a0)
         
-        # return to user mode and user pc.
-        # prepare_return() sets up sstatus and sepc.
+        # sret 返回用户模式。
+        #
+        # sret 是 RISC-V 从 S-mode 返回的专用指令，它会：
+        #   ① 把 PC 设为 sepc（prepare_return 已设置为用户 PC）
+        #   ② 把特权级设为 SPP 字段（已清 0 = U-mode）
+        #   ③ 如果 SPIE=1（已设），恢复中断使能
+        #
+        # 用户程序将从 ecall 的下一条指令继续执行。
         sret

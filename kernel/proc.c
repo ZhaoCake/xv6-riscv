@@ -107,6 +107,23 @@ allocpid()
 // and return with p->lock held.
 // If there are no free procs, or a memory allocation fails, return 0.
 static struct proc *
+/*
+ * allocproc() — 在进程表中分配一个空闲的 proc 结构体。
+ *
+ * 做的事：
+ *   ① 扫描 proc[] 表，找 state == UNUSED 的槽位
+ *   ② 分配 PID
+ *   ③ 分配 trapframe 页（内核内存，用于保存用户寄存器）
+ *   ④ 分配用户页表（proc_pagetable 同时映射了 TRAMPOLINE 和 TRAPFRAME）
+ *   ⑤ 设置 context.ra = forkret
+ *      ——进程第一次被调度器选中执行时，swtch() 会从这个 context 恢复，
+ *        从而从 forkret 开始执行（而不是从某个用户代码开始）
+ *
+ * context.ra 和 context.sp 的用途：
+ *   调度器通过 swtch() 切换进程时，保存当前寄存器到旧的 context，
+ *   从新的 context 恢复寄存器，然后 ret 跳到新的 ra。
+ *   新进程的 ra 指向 forkret——所以新进程第一次跑时从 forkret 开始。
+ */
 allocproc(void)
 {
   struct proc *p;
@@ -125,14 +142,16 @@ found:
   p->pid = allocpid();
   p->state = USED;
 
-  // Allocate a trapframe page.
+  // 分配一页物理内存作为 trapframe（保存所有用户寄存器）。
+  // trapframe 在内核地址空间中，通过 proc_pagetable 也映射到用户页表。
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
     freeproc(p);
     release(&p->lock);
     return 0;
   }
 
-  // An empty user page table.
+  // 创建用户页表。这个页表含 TRAMPOLINE 和 TRAPFRAME 映射，
+  // 但还没有用户代码页——由 kexec() 或 kfork() 负责添加。
   p->pagetable = proc_pagetable(p);
   if (p->pagetable == 0) {
     freeproc(p);
@@ -140,8 +159,9 @@ found:
     return 0;
   }
 
-  // Set up new context to start executing at forkret,
-  // which returns to user space.
+  // 设置 context 使进程首次被调度时从 forkret 开始执行。
+  // context.sp 指向内核栈顶——swtch() 会先恢复 sp，
+  // 然后 ret 到 ra（forkret）。
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
@@ -215,7 +235,23 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
   uvmfree(pagetable, sz);
 }
 
-// Set up first user process.
+/*
+ * userinit() — 创建第一个用户进程（init）。
+ *
+ * 这是系统启动时创建的第一个（也是唯一一个被手动创建的）进程。
+ * 它只做了三件事：
+ *   ① allocproc() 分配进程结构体 + trapframe + 页表
+ *   ② 设置 cwd（当前工作目录）为根目录 "/"
+ *   ③ 标记 state = RUNNABLE，让调度器能选中它
+ *
+ * 这个进程实际执行的代码不是在这里加载的。
+ * 进程第一次被调度时：
+ *   swtch() → forkret() → kexec("/init", ...) → 加载 /init 程序
+ *   → trampoline.S 的 sret 返回用户态 → 从 /init 的 _start 开始执行
+ *
+ * /init (user/init.c) 又 exec("sh", ...) 启动 shell。
+ * 所以「第一个进程」实际上是 init → sh。
+ */
 void
 userinit(void)
 {
@@ -500,8 +536,27 @@ yield(void)
   release(&p->lock);
 }
 
-// A fork child's very first scheduling by scheduler()
-// will swtch to forkret.
+/*
+ * forkret() — 新进程第一次被调度时执行的入口。
+ *
+ * allocproc() 把 context.ra 设成了 forkret，
+ * 所以调度器 swtch() 到这个进程时，ret 指令会跳到 forkret。
+ *
+ * forkret 做了关键的两件事：
+ *
+ *   ① 只有第一个进程（first == 1）做一次文件系统初始化：
+ *      fsinit(ROOTDEV) 读取磁盘超级块。
+ *      这不能在 main() 中做，因为 fsinit 可能 sleep，
+ *      而 main() 还没有进程上下文。
+ *
+ *   ② 直接调用 kexec("/init") 加载 /init 程序。
+ *      这是 xv6 的一个巧妙设计：第一个程序不是通过用户态 exec()
+ *      启动的，而是内核直接 kexec 加载的。
+ *      这样就不用像老版本那样手写一段 initcode 机器码。
+ *
+ * kexec 成功后，forkret 返回 → trampoline.S 的 userret → sret
+ * 跳转到 /init 入口 → init 进程在用户态开始运行。
+ */
 void
 forkret(void)
 {
@@ -509,21 +564,20 @@ forkret(void)
   static int first = 1;
   struct proc *p = myproc();
 
-  // Still holding p->lock from scheduler.
+  // 从调度器过来时还持有 p->lock，这里释放。
   release(&p->lock);
 
   if (first) {
-    // File system initialization must be run in the context of a
-    // regular process (e.g., because it calls sleep), and thus cannot
-    // be run from main().
+    // 文件系统初始化必须在进程上下文中执行（可能 sleep），
+    // 所以不能放在 main() 里。
     fsinit(ROOTDEV);
 
     first = 0;
-    // ensure other cores see first=0.
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 
-    // We can invoke kexec() now that file system is initialized.
-    // Put the return value (argc) of kexec into a0.
+    // 文件系统已就绪，直接让 init 进程加载 /init 程序。
+    // kexec 的返回值（argc）放到 a0 寄存器，
+    // 这样 /init 的 main(argc, argv) 能收到正确的 argc。
     p->trapframe->a0 = kexec("/init", (char *[]){"/init", 0});
     if (p->trapframe->a0 == -1) {
       panic("exec");
